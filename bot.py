@@ -1,699 +1,1516 @@
+import asyncio
 import os
-import sqlite3
-import logging
-from datetime import datetime, timezone
+import hmac
+import hashlib
+from datetime import datetime, timedelta, timezone
 
-from telegram import (
-    Update,
+import aiohttp
+import aiosqlite
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
+
+# Razorpay dashboard webhook secret
+RAZORPAY_WEBHOOK_SECRET = os.getenv(
+    "RAZORPAY_WEBHOOK_SECRET", ""
+).strip()
+
+# Railway public URL
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+
+DEMO_MINUTES = int(os.getenv("DEMO_MINUTES", "5"))
+
+# Default price in paise
+DEFAULT_PRICE = int(os.getenv("DEFAULT_PRICE", "29900"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN missing")
 
-logger = logging.getLogger(__name__)
+if not ADMIN_ID:
+    raise RuntimeError("ADMIN_ID missing")
+
+if not RAZORPAY_KEY_ID:
+    raise RuntimeError("RAZORPAY_KEY_ID missing")
+
+if not RAZORPAY_KEY_SECRET:
+    raise RuntimeError("RAZORPAY_KEY_SECRET missing")
+
+if not PUBLIC_BASE_URL:
+    raise RuntimeError("PUBLIC_BASE_URL missing")
 
 
-# =========================
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+
+dp.include_router(router)
+
+
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 
-def db():
-    return sqlite3.connect(DB_PATH)
+async def init_db():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id INTEGER PRIMARY KEY,
+                channel_name TEXT NOT NULL,
+                username TEXT,
+                added_at TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS courses (
+                channel_id INTEGER PRIMARY KEY,
+                course_name TEXT NOT NULL,
+                price INTEGER NOT NULL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS demos (
+                user_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                channel_id INTEGER NOT NULL,
+                course_name TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                razorpay_link_id TEXT UNIQUE,
+                razorpay_payment_id TEXT,
+                reference_id TEXT UNIQUE,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                paid_at TEXT
+            )
+        """)
+
+        await db.commit()
 
 
-def init_db():
-    con = db()
-    cur = con.cursor()
+# =========================================================
+# CHANNEL AUTO DETECT
+# =========================================================
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS courses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            channel_id TEXT NOT NULL UNIQUE,
-            price INTEGER NOT NULL DEFAULT 0,
-            demo_enabled INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
+async def save_channel(
+    channel_id: int,
+    title: str,
+    username: str | None
+):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute("""
+            INSERT OR REPLACE INTO channels
+            (
+                channel_id,
+                channel_name,
+                username,
+                added_at
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            channel_id,
+            title,
+            username,
+            datetime.now(timezone.utc).isoformat()
+        ))
+
+        await db.execute("""
+            INSERT OR IGNORE INTO courses
+            (
+                channel_id,
+                course_name,
+                price
+            )
+            VALUES (?, ?, ?)
+        """, (
+            channel_id,
+            title,
+            DEFAULT_PRICE
+        ))
+
+        await db.commit()
+
+
+async def get_channels():
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cur = await db.execute("""
+            SELECT
+                c.channel_id,
+                c.channel_name,
+                c.username,
+                co.course_name,
+                co.price
+            FROM channels c
+            JOIN courses co
+            ON co.channel_id = c.channel_id
+            ORDER BY c.rowid DESC
+        """)
+
+        return await cur.fetchall()
+
+
+async def get_channel(channel_id: int):
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cur = await db.execute("""
+            SELECT
+                c.channel_id,
+                c.channel_name,
+                c.username,
+                co.course_name,
+                co.price
+            FROM channels c
+            JOIN courses co
+            ON co.channel_id = c.channel_id
+            WHERE c.channel_id = ?
+        """, (channel_id,))
+
+        return await cur.fetchone()
+
+
+# =========================================================
+# AUTO CHANNEL ADMIN DETECTION
+# =========================================================
+
+@router.my_chat_member()
+async def channel_auto_detect(
+    event: ChatMemberUpdated
+):
+
+    chat = event.chat
+
+    if chat.type != "channel":
+        return
+
+    status = event.new_chat_member.status
+
+    # Bot became administrator
+    if status == "administrator":
+
+        await save_channel(
+            chat.id,
+            chat.title or "Unnamed Channel",
+            chat.username
         )
-    """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
+        try:
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            course_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            utr TEXT,
-            payment_id TEXT,
-            created_at TEXT NOT NULL,
-            verified_at TEXT
-        )
-    """)
+            await bot.send_message(
+                ADMIN_ID,
 
-    con.commit()
-    con.close()
+                "✅ <b>CHANNEL AUTO ADDED</b>\n\n"
+                f"📚 <b>{chat.title}</b>\n"
+                f"📌 <code>{chat.id}</code>\n\n"
+                f"💰 Default Price: ₹{DEFAULT_PRICE // 100}\n\n"
+                "अब public users इस course का demo "
+                "और payment ले सकते हैं।",
 
+                parse_mode="HTML"
+            )
 
-# =========================
-# HELPERS
-# =========================
+        except Exception:
+            pass
 
-def now():
-    return datetime.now(timezone.utc).isoformat()
+    # Bot removed from channel
+    elif status in ("left", "kicked"):
 
+        async with aiosqlite.connect(DB_PATH) as db:
 
-def save_user(user):
-    con = db()
-    con.execute("""
-        INSERT INTO users
-        (user_id, username, first_name, created_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (
-        user.id,
-        user.username or "",
-        user.first_name or "",
-        now(),
-    ))
-    con.commit()
-    con.close()
+            await db.execute(
+                "DELETE FROM channels WHERE channel_id=?",
+                (chat.id,)
+            )
+
+            await db.execute(
+                "DELETE FROM courses WHERE channel_id=?",
+                (chat.id,)
+            )
+
+            await db.commit()
 
 
-def get_courses():
-    con = db()
-    rows = con.execute("""
-        SELECT id, name, channel_id, price, demo_enabled
-        FROM courses
-        ORDER BY id DESC
-    """).fetchall()
-    con.close()
-    return rows
+# =========================================================
+# PUBLIC COURSE BUTTONS
+# =========================================================
 
+def course_keyboard(channels):
 
-def get_course(course_id):
-    con = db()
-    row = con.execute("""
-        SELECT id, name, channel_id, price, demo_enabled
-        FROM courses
-        WHERE id=?
-    """, (course_id,)).fetchone()
-    con.close()
-    return row
+    rows = []
 
+    for channel_id, channel_name, username, course_name, price in channels:
 
-# =========================
-# START / PUBLIC
-# =========================
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📚 {course_name} • ₹{price // 100}",
+                callback_data=f"course:{channel_id}"
+            )
+        ])
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    user = update.effective_user
-    save_user(user)
-
-    keyboard = [
-        [InlineKeyboardButton("📚 Courses", callback_data="courses")],
-        [InlineKeyboardButton("🛒 My Purchases", callback_data="purchases")],
-    ]
-
-    if user.id == OWNER_ID:
-        keyboard.append(
-            [InlineKeyboardButton("👑 Owner Panel", callback_data="owner")]
-        )
-
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "यहाँ से अपना course select करें।\n"
-        "पहले Demo देखें और फिर Purchase Now से course खरीदें।",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
     )
 
 
-# =========================
-# COURSE LIST
-# =========================
+# =========================================================
+# START
+# =========================================================
 
-async def show_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@router.message(Command("start"))
+async def start(message: Message):
 
-    query = update.callback_query
-    await query.answer()
+    channels = await get_channels()
 
-    courses = get_courses()
+    if not channels:
 
-    if not courses:
-        await query.edit_message_text(
+        await message.answer(
             "❌ अभी कोई course available नहीं है।"
         )
+
         return
 
-    buttons = []
+    await message.answer(
 
-    for course in courses:
-        cid, name, channel_id, price, demo = course
+        "👋 <b>Welcome</b>\n\n"
 
-        price_text = f"₹{price}" if price > 0 else "Price not set"
+        "📚 नीचे अपना course select करें।\n\n"
 
-        buttons.append([
-            InlineKeyboardButton(
-                f"📚 {name} • {price_text}",
-                callback_data=f"course:{cid}"
-            )
-        ])
+        f"🎁 Demo: <b>{DEMO_MINUTES} मिनट</b>\n"
 
-    await query.edit_message_text(
-        "📚 Available Courses:",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        "💳 Demo के बाद Razorpay से payment करके "
+        "permanent access मिलेगा।",
+
+        reply_markup=course_keyboard(channels),
+
+        parse_mode="HTML"
     )
 
 
-# =========================
-# COURSE DETAILS
-# =========================
+@router.message(Command("courses"))
+async def courses(message: Message):
 
-async def course_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channels = await get_channels()
 
-    query = update.callback_query
-    await query.answer()
+    if not channels:
 
-    course_id = int(query.data.split(":")[1])
-
-    course = get_course(course_id)
-
-    if not course:
-        await query.edit_message_text("❌ Course नहीं मिला।")
-        return
-
-    cid, name, channel_id, price, demo = course
-
-    buttons = []
-
-    if demo:
-        buttons.append([
-            InlineKeyboardButton(
-                "🎁 Demo Access",
-                callback_data=f"demo:{cid}"
-            )
-        ])
-
-    if price > 0:
-        buttons.append([
-            InlineKeyboardButton(
-                f"💳 Purchase Now ₹{price}",
-                callback_data=f"buy:{cid}"
-            )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="courses")
-    ])
-
-    await query.edit_message_text(
-        f"📚 <b>{name}</b>\n\n"
-        f"💰 Price: ₹{price}\n\n"
-        f"🎁 पहले Demo देखें।\n"
-        f"💳 पसंद आने पर Purchase Now करें।",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# =========================
-# DEMO
-# =========================
-
-async def demo_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    course_id = int(query.data.split(":")[1])
-    course = get_course(course_id)
-
-    if not course:
-        await query.edit_message_text("❌ Course नहीं मिला।")
-        return
-
-    cid, name, channel_id, price, demo = course
-
-    try:
-        # Bot must be administrator in the course channel.
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=channel_id,
-            member_limit=1
+        await message.answer(
+            "❌ कोई course available नहीं है।"
         )
 
-        keyboard = [[
-            InlineKeyboardButton(
-                "🎁 Join Demo",
-                url=invite.invite_link
-            )
-        ], [
-            InlineKeyboardButton(
-                f"💳 Purchase Now ₹{price}",
-                callback_data=f"buy:{cid}"
-            )
-        ]]
+        return
 
-        await query.edit_message_text(
-            f"🎁 <b>{name} Demo</b>\n\n"
-            "Demo access link नीचे है.\n"
-            "Demo देखने के बाद Purchase Now से पूरा course खरीद सकते हैं।",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+    await message.answer(
+        "📚 <b>Available Courses</b>",
+        reply_markup=course_keyboard(channels),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# COURSE SELECT
+# =========================================================
+
+@router.callback_query(
+    F.data.startswith("course:")
+)
+async def course_selected(
+    callback: CallbackQuery
+):
+
+    channel_id = int(
+        callback.data.split(":")[1]
+    )
+
+    course = await get_channel(channel_id)
+
+    if not course:
+
+        await callback.answer(
+            "❌ Course नहीं मिला।",
+            show_alert=True
+        )
+
+        return
+
+    (
+        channel_id,
+        channel_name,
+        username,
+        course_name,
+        price
+    ) = course
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🎁 {DEMO_MINUTES} मिनट Demo",
+                    callback_data=f"demo:{channel_id}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Buy Now ₹{price // 100}",
+                    callback_data=f"buy:{channel_id}"
+                )
+            ]
+        ]
+    )
+
+    await callback.message.answer(
+
+        f"📚 <b>{course_name}</b>\n\n"
+
+        f"💰 Price: <b>₹{price // 100}</b>\n\n"
+
+        "पहले demo देख सकते हैं।\n"
+        "पसंद आने पर Razorpay से payment करें।",
+
+        reply_markup=keyboard,
+
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# DEMO LINK
+# =========================================================
+
+@router.callback_query(
+    F.data.startswith("demo:")
+)
+async def create_demo(
+    callback: CallbackQuery
+):
+
+    user_id = callback.from_user.id
+
+    channel_id = int(
+        callback.data.split(":")[1]
+    )
+
+    course = await get_channel(channel_id)
+
+    if not course:
+
+        await callback.answer(
+            "❌ Course उपलब्ध नहीं है।",
+            show_alert=True
+        )
+
+        return
+
+    try:
+
+        me = await bot.get_me()
+
+        member = await bot.get_chat_member(
+            channel_id,
+            me.id
+        )
+
+        if member.status != "administrator":
+
+            await callback.answer(
+                "❌ Demo temporarily unavailable.",
+                show_alert=True
+            )
+
+            return
+
+        if (
+            hasattr(member, "can_invite_users")
+            and not member.can_invite_users
+        ):
+
+            await callback.answer(
+                "❌ Bot को Invite Users permission दें।",
+                show_alert=True
+            )
+
+            return
+
+        if (
+            hasattr(member, "can_restrict_members")
+            and not member.can_restrict_members
+        ):
+
+            await callback.answer(
+                "❌ Bot को Ban Users permission दें।",
+                show_alert=True
+            )
+
+            return
+
+    except Exception:
+
+        await callback.answer(
+            "❌ Channel verify नहीं हो पाया।",
+            show_alert=True
+        )
+
+        return
+
+    # Remove old demo
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute(
+            "DELETE FROM demos WHERE user_id=?",
+            (user_id,)
+        )
+
+        await db.commit()
+
+    try:
+
+        invite = await bot.create_chat_invite_link(
+
+            chat_id=channel_id,
+
+            member_limit=1,
+
+            name=f"Demo-{user_id}"
+        )
+
+    except Exception:
+
+        await callback.answer(
+            "❌ Demo link generate नहीं हो पाया।",
+            show_alert=True
+        )
+
+        return
+
+    expires = (
+        datetime.now(timezone.utc)
+        + timedelta(minutes=DEMO_MINUTES)
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        await db.execute("""
+            INSERT OR REPLACE INTO demos
+            (
+                user_id,
+                channel_id,
+                expires_at
+            )
+            VALUES (?, ?, ?)
+        """, (
+            user_id,
+            channel_id,
+            expires.isoformat()
+        ))
+
+        await db.commit()
+
+    await callback.message.answer(
+
+        f"🎁 <b>Demo Ready</b>\n\n"
+
+        f"📚 {course[3]}\n"
+
+        f"⏱ Time: <b>{DEMO_MINUTES} मिनट</b>\n\n"
+
+        f"🔗 <a href=\"{invite.invite_link}\">"
+        "👉 JOIN DEMO"
+        "</a>\n\n"
+
+        "⚠️ Demo पूरा होने पर access automatically "
+        "remove हो जाएगा।\n\n"
+
+        "Demo पसंद आने पर वापस जाकर "
+        "💳 Buy Now दबाएँ।",
+
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# RAZORPAY API
+# =========================================================
+
+async def razorpay_request(
+    method: str,
+    endpoint: str,
+    data=None
+):
+
+    url = (
+        "https://api.razorpay.com/v1"
+        + endpoint
+    )
+
+    auth = aiohttp.BasicAuth(
+        RAZORPAY_KEY_ID,
+        RAZORPAY_KEY_SECRET
+    )
+
+    async with aiohttp.ClientSession(
+        auth=auth
+    ) as session:
+
+        async with session.request(
+            method,
+            url,
+            json=data
+        ) as response:
+
+            text = await response.text()
+
+            if response.status >= 400:
+
+                raise RuntimeError(
+                    f"Razorpay API error "
+                    f"{response.status}: {text}"
+                )
+
+            return await response.json()
+
+
+# =========================================================
+# CREATE RAZORPAY PAYMENT LINK
+# =========================================================
+
+@router.callback_query(
+    F.data.startswith("buy:")
+)
+async def buy_course(
+    callback: CallbackQuery
+):
+
+    user = callback.from_user
+
+    channel_id = int(
+        callback.data.split(":")[1]
+    )
+
+    course = await get_channel(channel_id)
+
+    if not course:
+
+        await callback.answer(
+            "❌ Course नहीं मिला।",
+            show_alert=True
+        )
+
+        return
+
+    (
+        channel_id,
+        channel_name,
+        username,
+        course_name,
+        price
+    ) = course
+
+    # Unique reference
+    reference_id = (
+        f"tg{user.id}_"
+        f"{int(datetime.now().timestamp())}"
+    )[:40]
+
+    try:
+
+        payment_link = await razorpay_request(
+
+            "POST",
+
+            "/payment_links",
+
+            {
+                "amount": price,
+
+                "currency": "INR",
+
+                "accept_partial": False,
+
+                "description":
+                    f"{course_name} - Telegram Access",
+
+                "reference_id":
+                    reference_id,
+
+                "customer": {
+                    "name":
+                        user.full_name[:100]
+                },
+
+                "notify": {
+                    "sms": False,
+                    "email": False
+                },
+
+                "reminder_enable": False,
+
+                "callback_url":
+                    f"{PUBLIC_BASE_URL}/razorpay/callback",
+
+                "callback_method": "get",
+
+                "notes": {
+                    "telegram_user_id":
+                        str(user.id),
+
+                    "channel_id":
+                        str(channel_id)
+                }
+            }
         )
 
     except Exception as e:
-        logger.exception("Demo invite error")
 
-        await query.edit_message_text(
-            "❌ Demo link generate नहीं हो पाया।\n"
-            "Bot को channel में administrator होना चाहिए।"
+        await callback.message.answer(
+            "❌ Payment link create नहीं हो पाया.\n"
+            "कुछ समय बाद फिर try करें।"
         )
 
+        try:
 
-# =========================
-# BUY
-# =========================
-
-async def buy_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    course_id = int(query.data.split(":")[1])
-    course = get_course(course_id)
-
-    if not course:
-        await query.edit_message_text("❌ Course नहीं मिला।")
-        return
-
-    cid, name, channel_id, price, demo = course
-
-    if price <= 0:
-        await query.edit_message_text(
-            "❌ इस course की price अभी set नहीं है।"
-        )
-        return
-
-    con = db()
-
-    cur = con.execute("""
-        INSERT INTO payments
-        (user_id, course_id, amount, status, created_at)
-        VALUES (?, ?, ?, 'pending', ?)
-    """, (
-        query.from_user.id,
-        course_id,
-        price,
-        now()
-    ))
-
-    payment_db_id = cur.lastrowid
-
-    con.commit()
-    con.close()
-
-    # IMPORTANT:
-    # यहाँ actual Razorpay order/payment-link creation connect करना होगा.
-    #
-    # अभी user को payment verification page की जगह
-    # setup message दिया जा रहा है ताकि fake payment को success
-    # न माना जाए.
-
-    await query.edit_message_text(
-        f"💳 <b>{name}</b>\n\n"
-        f"Amount: ₹{price}\n\n"
-        "Payment system configured होने के बाद यहाँ "
-        "secure Razorpay payment button आएगा।\n\n"
-        f"Payment ID: #{payment_db_id}",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data=f"course:{course_id}"
-                )
-            ]
-        ])
-    )
-
-
-# =========================
-# OWNER PANEL
-# =========================
-
-async def owner_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != OWNER_ID:
-        await query.answer("❌ Access denied", show_alert=True)
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Course", callback_data="add_course")],
-        [InlineKeyboardButton("💰 Price Panel", callback_data="prices")],
-        [InlineKeyboardButton("📚 Manage Courses", callback_data="manage_courses")],
-    ]
-
-    await query.edit_message_text(
-        "👑 <b>Owner Panel</b>",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# =========================
-# PRICE PANEL
-# =========================
-
-async def price_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != OWNER_ID:
-        return
-
-    courses = get_courses()
-
-    if not courses:
-        await query.edit_message_text(
-            "❌ कोई course नहीं है।",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⬅️ Back", callback_data="owner")]
-            ])
-        )
-        return
-
-    buttons = []
-
-    for cid, name, channel_id, price, demo in courses:
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"💰 {name} — ₹{price}",
-                callback_data=f"setprice:{cid}"
+            await bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Razorpay Error\n\n<code>{e}</code>",
+                parse_mode="HTML"
             )
-        ])
 
-    buttons.append([
-        InlineKeyboardButton("⬅️ Back", callback_data="owner")
-    ])
+        except Exception:
+            pass
 
-    await query.edit_message_text(
-        "💰 <b>Price Panel</b>\n\n"
-        "जिस course की price बदलनी है उसे select करो:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+        await callback.answer()
 
-
-# =========================
-# SET PRICE
-# =========================
-
-async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != OWNER_ID:
         return
 
-    course_id = int(query.data.split(":")[1])
+    link_id = payment_link["id"]
 
-    course = get_course(course_id)
+    short_url = payment_link["short_url"]
 
-    if not course:
-        return
+    async with aiosqlite.connect(DB_PATH) as db:
 
-    context.user_data["set_price_course"] = course_id
-
-    await query.edit_message_text(
-        f"💰 <b>{course[1]}</b>\n\n"
-        "नई price भेजें.\n\n"
-        "Example:\n"
-        "<code>799</code>",
-        parse_mode="HTML"
-    )
-
-
-async def receive_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != OWNER_ID:
-        return
-
-    course_id = context.user_data.get("set_price_course")
-
-    if not course_id:
-        return
-
-    text = update.message.text.strip()
-
-    if not text.isdigit():
-        await update.message.reply_text(
-            "❌ सिर्फ number भेजो.\nExample: 799"
-        )
-        return
-
-    price = int(text)
-
-    if price <= 0:
-        await update.message.reply_text(
-            "❌ Price 0 से ज्यादा होनी चाहिए."
-        )
-        return
-
-    con = db()
-
-    con.execute(
-        "UPDATE courses SET price=? WHERE id=?",
-        (price, course_id)
-    )
-
-    con.commit()
-    con.close()
-
-    context.user_data.pop("set_price_course", None)
-
-    await update.message.reply_text(
-        f"✅ Price successfully set: ₹{price}"
-    )
-
-
-# =========================
-# ADD COURSE
-# =========================
-
-async def add_course_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != OWNER_ID:
-        return
-
-    context.user_data["adding_course"] = True
-
-    await query.edit_message_text(
-        "➕ <b>Add Course</b>\n\n"
-        "इस format में भेजो:\n\n"
-        "<code>Course Name | -1001234567890</code>\n\n"
-        "Price बाद में Price Panel से set कर सकते हो.",
-        parse_mode="HTML"
-    )
-
-
-async def receive_course(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != OWNER_ID:
-        return
-
-    if not context.user_data.get("adding_course"):
-        return
-
-    text = update.message.text.strip()
-
-    parts = [x.strip() for x in text.split("|")]
-
-    if len(parts) != 2:
-        await update.message.reply_text(
-            "❌ Format गलत है.\n\n"
-            "Example:\n"
-            "Ceramic RAS | -1001234567890"
-        )
-        return
-
-    name, channel_id = parts
-
-    con = db()
-
-    try:
-        con.execute("""
-            INSERT INTO courses
-            (name, channel_id, price, demo_enabled, created_at)
-            VALUES (?, ?, 0, 1, ?)
+        await db.execute("""
+            INSERT INTO payments
+            (
+                user_id,
+                channel_id,
+                course_name,
+                amount,
+                razorpay_link_id,
+                reference_id,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            name,
+
+            user.id,
+
             channel_id,
-            now()
+
+            course_name,
+
+            price,
+
+            link_id,
+
+            reference_id,
+
+            "created",
+
+            datetime.now(
+                timezone.utc
+            ).isoformat()
         ))
 
-        con.commit()
+        await db.commit()
 
-        await update.message.reply_text(
-            f"✅ Course added.\n\n"
-            f"📚 {name}\n"
-            f"📢 {channel_id}\n\n"
-            "अब Owner Panel → Price Panel में जाकर price set कर दो."
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Pay ₹{price // 100}",
+                    url=short_url
+                )
+            ],
+
+            [
+                InlineKeyboardButton(
+                    text="🔄 Check Payment",
+                    callback_data=f"check:{link_id}"
+                )
+            ]
+
+        ]
+    )
+
+    await callback.message.answer(
+
+        f"💳 <b>Payment</b>\n\n"
+
+        f"📚 {course_name}\n"
+
+        f"💰 Amount: <b>₹{price // 100}</b>\n\n"
+
+        "नीचे Pay button दबाकर Razorpay payment करें।\n\n"
+
+        "Payment successful होने के बाद "
+        "आपको permanent access मिलेगा।",
+
+        reply_markup=keyboard,
+
+        parse_mode="HTML"
+    )
+
+    await callback.answer()
+
+
+# =========================================================
+# PAYMENT VERIFICATION
+# =========================================================
+
+async def verify_payment_link(
+    link_id: str
+):
+
+    data = await razorpay_request(
+        "GET",
+        f"/payment_links/{link_id}"
+    )
+
+    return data
+
+
+async def process_successful_payment(
+    link_id: str,
+    payment_id: str | None = None
+):
+
+    payment_info = await verify_payment_link(
+        link_id
+    )
+
+    status = payment_info.get(
+        "status"
+    )
+
+    if status != "paid":
+        return False
+
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cur = await db.execute("""
+            SELECT
+                id,
+                user_id,
+                channel_id,
+                course_name,
+                amount,
+                status
+            FROM payments
+            WHERE razorpay_link_id=?
+        """, (link_id,))
+
+        row = await cur.fetchone()
+
+        if not row:
+            return False
+
+        (
+            db_id,
+            user_id,
+            channel_id,
+            course_name,
+            amount,
+            old_status
+        ) = row
+
+        # Already processed
+        if old_status == "paid":
+            return True
+
+        await db.execute("""
+            UPDATE payments
+            SET
+                status='paid',
+                razorpay_payment_id=?,
+                paid_at=?
+            WHERE id=?
+        """, (
+            payment_id,
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+            db_id
+        ))
+
+        await db.commit()
+
+    # Generate permanent one-use invite
+    try:
+
+        invite = await bot.create_chat_invite_link(
+
+            chat_id=channel_id,
+
+            member_limit=1,
+
+            name=f"PAID-{user_id}"
         )
 
-    except sqlite3.IntegrityError:
-        await update.message.reply_text(
-            "❌ यह channel पहले से added है."
+    except Exception as e:
+
+        await bot.send_message(
+            ADMIN_ID,
+
+            "⚠️ <b>PAYMENT SUCCESS लेकिन LINK ERROR</b>\n\n"
+            f"👤 User ID: <code>{user_id}</code>\n"
+            f"📚 {course_name}\n"
+            f"💰 ₹{amount // 100}\n"
+            f"💳 Payment: <code>{payment_id or 'N/A'}</code>\n\n"
+            f"❌ Invite error:\n<code>{e}</code>",
+
+            parse_mode="HTML"
+        )
+
+        return False
+
+    # USER notification
+    try:
+
+        await bot.send_message(
+
+            user_id,
+
+            f"🎉 <b>Payment Successful!</b>\n\n"
+
+            f"📚 <b>{course_name}</b>\n"
+
+            f"💰 Paid: <b>₹{amount // 100}</b>\n\n"
+
+            "✅ आपका permanent access तैयार है।\n\n"
+
+            f"🔗 <a href=\"{invite.invite_link}\">"
+            "👉 JOIN PREMIUM CHANNEL"
+            "</a>",
+
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+    # OWNER notification
+    try:
+
+        await bot.send_message(
+
+            ADMIN_ID,
+
+            "🎉 <b>PURCHASE SUCCESSFUL</b>\n\n"
+
+            f"👤 Name: <b>{user_id}</b>\n"
+            f"🆔 User ID: <code>{user_id}</code>\n\n"
+
+            f"📚 Course: <b>{course_name}</b>\n"
+
+            f"💰 Amount: <b>₹{amount // 100}</b>\n"
+
+            f"💳 Payment ID:\n"
+            f"<code>{payment_id or 'N/A'}</code>\n\n"
+
+            f"🔗 Razorpay Link:\n"
+            f"<code>{link_id}</code>\n\n"
+
+            "✅ Payment verified successfully.",
+
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        pass
+
+    return True
+
+
+# =========================================================
+# CHECK PAYMENT BUTTON
+# =========================================================
+
+@router.callback_query(
+    F.data.startswith("check:")
+)
+async def check_payment(
+    callback: CallbackQuery
+):
+
+    link_id = callback.data.split(
+        ":",
+        1
+    )[1]
+
+    try:
+
+        data = await verify_payment_link(
+            link_id
+        )
+
+        if data.get("status") != "paid":
+
+            await callback.answer(
+                "⏳ Payment अभी verified नहीं हुआ है।",
+                show_alert=True
+            )
+
+            return
+
+        payment_id = data.get(
+            "payments",
+            {}
+        )
+
+        payment_id = None
+
+        await process_successful_payment(
+            link_id,
+            payment_id
+        )
+
+        await callback.answer(
+            "✅ Payment verified!",
+            show_alert=True
+        )
+
+    except Exception:
+
+        await callback.answer(
+            "❌ Payment verification failed.",
+            show_alert=True
+        )
+
+
+# =========================================================
+# RAZORPAY CALLBACK
+# =========================================================
+
+async def razorpay_callback(
+    request: web.Request
+):
+
+    params = request.rel_url.query
+
+    link_id = params.get(
+        "razorpay_payment_link_id"
+    )
+
+    status = params.get(
+        "razorpay_payment_link_status"
+    )
+
+    reference_id = params.get(
+        "razorpay_payment_link_reference_id"
+    )
+
+    signature = params.get(
+        "razorpay_signature"
+    )
+
+    # Some Razorpay callback configurations
+    # use razorpay_payment_link_sign.
+    if not signature:
+
+        signature = params.get(
+            "razorpay_payment_link_sign"
+        )
+
+    if not link_id:
+
+        return web.Response(
+            text="Invalid payment callback."
+        )
+
+    # Verify callback signature when supplied
+    if signature:
+
+        message = (
+            f"{link_id}|"
+            f"{reference_id or ''}|"
+            f"{status or ''}"
+        )
+
+        expected = hmac.new(
+
+            RAZORPAY_KEY_SECRET.encode(),
+
+            message.encode(),
+
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            expected,
+            signature
+        ):
+
+            return web.Response(
+                status=400,
+                text="Invalid signature."
+            )
+
+    if status == "paid":
+
+        await process_successful_payment(
+            link_id
+        )
+
+        return web.Response(
+
+            text=(
+                "Payment Successful! "
+                "Telegram bot में वापस जाएँ। "
+                "आपको permanent access link मिल गया है."
+            ),
+
+            content_type="text/plain"
+        )
+
+    return web.Response(
+        text=(
+            "Payment अभी successful नहीं हुआ। "
+            "Telegram bot में वापस जाकर Check Payment दबाएँ."
+        ),
+        content_type="text/plain"
+    )
+
+
+# =========================================================
+# RAZORPAY WEBHOOK
+# =========================================================
+
+async def razorpay_webhook(
+    request: web.Request
+):
+
+    raw_body = await request.read()
+
+    signature = request.headers.get(
+        "X-Razorpay-Signature",
+        ""
+    )
+
+    if RAZORPAY_WEBHOOK_SECRET:
+
+        expected = hmac.new(
+
+            RAZORPAY_WEBHOOK_SECRET.encode(),
+
+            raw_body,
+
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            expected,
+            signature
+        ):
+
+            return web.Response(
+                status=400,
+                text="Invalid webhook signature."
+            )
+
+    try:
+
+        payload = await request.json()
+
+        payment_link_entity = (
+            payload
+            .get("payload", {})
+            .get("payment_link", {})
+            .get("entity", {})
+        )
+
+        link_id = payment_link_entity.get(
+            "id"
+        )
+
+        if link_id:
+
+            payment_entity = (
+                payload
+                .get("payload", {})
+                .get("payment", {})
+                .get("entity", {})
+            )
+
+            payment_id = payment_entity.get(
+                "id"
+            )
+
+            if payload.get("event") == "payment_link.paid":
+
+                await process_successful_payment(
+                    link_id,
+                    payment_id
+                )
+
+        return web.Response(
+            text="OK"
+        )
+
+    except Exception as e:
+
+        try:
+
+            await bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Webhook error:\n<code>{e}</code>",
+                parse_mode="HTML"
+            )
+
+        except Exception:
+            pass
+
+        return web.Response(
+            status=500,
+            text="Webhook error"
+        )
+
+
+# =========================================================
+# DEMO CLEANUP
+# =========================================================
+
+async def demo_cleanup_loop():
+
+    while True:
+
+        try:
+
+            now = datetime.now(
+                timezone.utc
+            )
+
+            async with aiosqlite.connect(
+                DB_PATH
+            ) as db:
+
+                cur = await db.execute("""
+                    SELECT
+                        user_id,
+                        channel_id,
+                        expires_at
+                    FROM demos
+                """)
+
+                demos = await cur.fetchall()
+
+            for (
+                user_id,
+                channel_id,
+                expires_text
+            ) in demos:
+
+                try:
+
+                    expires = datetime.fromisoformat(
+                        expires_text
+                    )
+
+                    if expires.tzinfo is None:
+
+                        expires = expires.replace(
+                            tzinfo=timezone.utc
+                        )
+
+                except Exception:
+
+                    expires = now
+
+                if now < expires:
+                    continue
+
+                try:
+
+                    await bot.ban_chat_member(
+                        chat_id=channel_id,
+                        user_id=user_id
+                    )
+
+                    await bot.unban_chat_member(
+                        chat_id=channel_id,
+                        user_id=user_id,
+                        only_if_banned=True
+                    )
+
+                except Exception:
+                    pass
+
+                async with aiosqlite.connect(
+                    DB_PATH
+                ) as db:
+
+                    await db.execute(
+                        "DELETE FROM demos WHERE user_id=?",
+                        (user_id,)
+                    )
+
+                    await db.commit()
+
+        except Exception:
+            pass
+
+        await asyncio.sleep(10)
+
+
+# =========================================================
+# OWNER COMMAND - SET PRICE
+# =========================================================
+
+@router.message(Command("setprice"))
+async def set_price(
+    message: Message
+):
+
+    if message.from_user.id != ADMIN_ID:
+
+        await message.answer(
+            "❌ Owner only."
+        )
+
+        return
+
+    parts = message.text.split(
+        maxsplit=2
+    )
+
+    if len(parts) != 3:
+
+        await message.answer(
+            "Usage:\n"
+            "/setprice CHANNEL_ID PRICE\n\n"
+            "Example:\n"
+            "/setprice -1001234567890 499"
+        )
+
+        return
+
+    try:
+
+        channel_id = int(parts[1])
+
+        rupees = int(parts[2])
+
+        price = rupees * 100
+
+    except ValueError:
+
+        await message.answer(
+            "❌ Invalid value."
+        )
+
+        return
+
+    course = await get_channel(
+        channel_id
+    )
+
+    if not course:
+
+        await message.answer(
+            "❌ Channel auto-detect नहीं हुआ।"
+        )
+
+        return
+
+    async with aiosqlite.connect(
+        DB_PATH
+    ) as db:
+
+        await db.execute("""
+            UPDATE courses
+            SET price=?
+            WHERE channel_id=?
+        """, (
+            price,
+            channel_id
+        ))
+
+        await db.commit()
+
+    await message.answer(
+        f"✅ Price updated: ₹{rupees}"
+    )
+
+
+# =========================================================
+# OWNER CHANNEL LIST
+# =========================================================
+
+@router.message(Command("channels"))
+async def owner_channels(
+    message: Message
+):
+
+    if message.from_user.id != ADMIN_ID:
+
+        await message.answer(
+            "❌ Owner only."
+        )
+
+        return
+
+    channels = await get_channels()
+
+    if not channels:
+
+        await message.answer(
+            "❌ No channels."
+        )
+
+        return
+
+    text = "📚 <b>Auto Detected Channels</b>\n\n"
+
+    for row in channels:
+
+        (
+            channel_id,
+            channel_name,
+            username,
+            course_name,
+            price
+        ) = row
+
+        text += (
+            f"📚 <b>{course_name}</b>\n"
+            f"📌 <code>{channel_id}</code>\n"
+            f"💰 ₹{price // 100}\n\n"
+        )
+
+    await message.answer(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# WEB SERVER
+# =========================================================
+
+async def start_web_server():
+
+    app = web.Application()
+
+    app.router.add_get(
+        "/razorpay/callback",
+        razorpay_callback
+    )
+
+    app.router.add_post(
+        "/razorpay/webhook",
+        razorpay_webhook
+    )
+
+    app.router.add_get(
+        "/",
+        lambda request: web.Response(
+            text="Bot is running."
+        )
+    )
+
+    runner = web.AppRunner(app)
+
+    await runner.setup()
+
+    port = int(
+        os.getenv("PORT", "8080")
+    )
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        port
+    )
+
+    await site.start()
+
+    print(
+        f"Web server running on port {port}"
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+async def main():
+
+    await init_db()
+
+    await start_web_server()
+
+    cleanup_task = asyncio.create_task(
+        demo_cleanup_loop()
+    )
+
+    try:
+
+        print(
+            "PUBLIC RAZORPAY BOT STARTED"
+        )
+
+        await dp.start_polling(
+            bot,
+            allowed_updates=
+                dp.resolve_used_update_types()
         )
 
     finally:
-        con.close()
 
-    context.user_data.pop("adding_course", None)
+        cleanup_task.cancel()
 
-
-# =========================
-# COMMANDS
-# =========================
-
-async def owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != OWNER_ID:
-        return
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Add Course", callback_data="add_course")],
-        [InlineKeyboardButton("💰 Price Panel", callback_data="prices")],
-        [InlineKeyboardButton("📚 Courses", callback_data="courses")],
-    ]
-
-    await update.message.reply_text(
-        "👑 Owner Panel",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-# =========================
-# CALLBACK ROUTER
-# =========================
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    query = update.callback_query
-
-    data = query.data
-
-    if data == "courses":
-        await show_courses(update, context)
-
-    elif data == "owner":
-        await owner_panel(update, context)
-
-    elif data == "prices":
-        await price_panel(update, context)
-
-    elif data == "add_course":
-        await add_course_start(update, context)
-
-    elif data.startswith("setprice:"):
-        await set_price(update, context)
-
-    elif data.startswith("course:"):
-        await course_details(update, context)
-
-    elif data.startswith("demo:"):
-        await demo_access(update, context)
-
-    elif data.startswith("buy:"):
-        await buy_course(update, context)
-
-
-# =========================
-# MAIN
-# =========================
-
-def main():
-
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
-
-    if not OWNER_ID:
-        raise RuntimeError("OWNER_ID missing")
-
-    init_db()
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("owner", owner_command))
-
-    app.add_handler(
-        CallbackQueryHandler(callbacks)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_text
-        )
-    )
-
-    logger.info("Bot started")
-
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES
-    )
-
-
-async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
-    if update.effective_user.id != OWNER_ID:
-        return
-
-    if context.user_data.get("set_price_course"):
-        await receive_price(update, context)
-        return
-
-    if context.user_data.get("adding_course"):
-        await receive_course(update, context)
-        return
+        await bot.session.close()
 
 
 if __name__ == "__main__":
-    main()
+
+    asyncio.run(main())
