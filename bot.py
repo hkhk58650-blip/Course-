@@ -1,4 +1,4 @@
-import asyncio
+import import aiohttp
 import os
 import hmac
 import hashlib
