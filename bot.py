@@ -4,6 +4,7 @@ import base64
 import json
 import urllib.request
 import urllib.error
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import aiosqlite
@@ -27,6 +28,9 @@ RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 DEMO_MINUTES = max(1, int(os.getenv("DEMO_MINUTES", "5")))
 DEFAULT_PRICE = max(1, int(os.getenv("DEFAULT_PRICE", "299")))  # rupees
+FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
+FORCE_JOIN_LINK = os.getenv("FORCE_JOIN_LINK", "https://t.me/+Cr5OKRJHfHwwYjNl").strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "raj_bro").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
@@ -45,6 +49,7 @@ dp.include_router(router)
 BOT_USERNAME = ""
 manual_price_mode = set()
 all_price_mode = set()
+processing_payments = set()
 
 
 # ============================================================
@@ -55,7 +60,7 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def money(paise):
-    return f"₹{int(paise) // 100}"
+    return f"â¹{int(paise) // 100}"
 
 def clean_html(value):
     return str(value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -349,21 +354,38 @@ async def owner_notify(text):
 # ============================================================
 
 def razorpay_sync(method, endpoint, payload=None):
+    """Call Razorpay API and return JSON, with readable API errors."""
     url = "https://api.razorpay.com/v1" + endpoint
-    auth = base64.b64encode(
-        f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()
-    ).decode()
+
+    raw_auth = f"{RAZORPAY_KEY_ID}:{RAZORPAY_KEY_SECRET}".encode()
+    auth = base64.b64encode(raw_auth).decode()
+
     headers = {
         "Authorization": f"Basic {auth}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Telegram-Course-Bot/2.0"
     }
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(url=url, data=body, headers=headers, method=method)
+
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Razorpay HTTP {e.code}: {e.read().decode(errors='ignore')}")
+        with urllib.request.urlopen(request, timeout=30) as response:
+            raw = response.read().decode("utf-8", errors="ignore")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        try:
+            data = json.loads(raw)
+            msg = data.get("error", {}).get("description") or data.get("error", {}).get("reason") or raw
+        except Exception:
+            msg = raw
+        raise RuntimeError(f"Razorpay HTTP {exc.code}: {msg}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Razorpay network error: {exc.reason}")
+    except Exception as exc:
+        raise RuntimeError(str(exc))
 
 
 async def razorpay(method, endpoint, payload=None):
@@ -373,48 +395,154 @@ async def razorpay(method, endpoint, payload=None):
 # ============================================================
 # PUBLIC START / INLINE
 # ============================================================
+# ============================================================
+# OPTIONAL FORCE JOIN / USER MENU
+# ============================================================
+
+async def is_force_joined(user_id):
+    if not FORCE_JOIN_CHANNEL_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(int(FORCE_JOIN_CHANNEL_ID), user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        print("FORCE JOIN CHECK:", e)
+        return False
+
+
+def join_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="ð¢ à¤à¥à¤¨à¤² à¤à¥à¤à¤¨ à¤à¤°à¥à¤ / Join Channel", url=FORCE_JOIN_LINK)],
+        [InlineKeyboardButton(text="â à¤µà¥à¤°à¥à¤«à¤¾à¤ à¤à¤°à¥à¤ / Verify", callback_data="verify_join")]
+    ])
+
+
+def user_home_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="ð à¤à¥à¤¨à¤² à¤à¥à¤à¥à¤ / Channel Search", switch_inline_query_current_chat="")],
+        [InlineKeyboardButton(text="ð à¤à¥à¤¸à¥ à¤à¤°à¥à¤¦à¥à¤? / How to Buy", callback_data="how_to_buy")],
+        [InlineKeyboardButton(text="ð§¾ à¤à¤°à¥à¤¦à¤¾à¤°à¥ à¤à¤¤à¤¿à¤¹à¤¾à¤¸ / Purchase History", callback_data="purchase_history")],
+        [InlineKeyboardButton(text="ð¨âð» à¤à¤¡à¤®à¤¿à¤¨ à¤¸à¤à¤ªà¤°à¥à¤ / Admin Contact", url=f"https://t.me/{ADMIN_USERNAME}")]
+    ])
+
+
+async def send_join_screen(message):
+    await message.answer(
+        "ð <b>Welcome / à¤¸à¥à¤µà¤¾à¤à¤¤ à¤¹à¥!</b>\n\n"
+        "ð <b>Course Purchase Bot</b>\n\n"
+        "Bot à¤à¤¸à¥à¤¤à¥à¤®à¤¾à¤² à¤à¤°à¤¨à¥ à¤à¥ à¤²à¤¿à¤ à¤ªà¤¹à¤²à¥ à¤¹à¤®à¤¾à¤°à¥ Official Channel à¤à¥ Join à¤à¤°à¥à¤à¥¤\n"
+        "Please join our official channel first to continue.\n\n"
+        "ð Join à¤à¤°à¤¨à¥ à¤à¥ à¤¬à¤¾à¤¦ Verify à¤¦à¤¬à¤¾à¤à¤à¥¤",
+        reply_markup=join_kb(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "verify_join")
+async def verify_join(callback: CallbackQuery):
+    if await is_force_joined(callback.from_user.id):
+        await callback.answer("â Verified / à¤¸à¤¤à¥à¤¯à¤¾à¤ªà¤¨ à¤¸à¤«à¤²")
+        await callback.message.edit_text(
+            "ð <b>Welcome / à¤¸à¥à¤µà¤¾à¤à¤¤ à¤¹à¥!</b>\n\n"
+            "à¤à¤¬ à¤à¤ª Course à¤à¥à¤ à¤¸à¤à¤¤à¥ à¤¹à¥à¤, Demo à¤¦à¥à¤ à¤¸à¤à¤¤à¥ à¤¹à¥à¤ à¤à¤° Purchase à¤à¤° à¤¸à¤à¤¤à¥ à¤¹à¥à¤à¥¤\n\n"
+            "ð¨âð» <b>Admin / à¤à¤¡à¤®à¤¿à¤¨:</b> @" + ADMIN_USERNAME,
+            reply_markup=user_home_kb(),
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer("â à¤ªà¤¹à¤²à¥ Channel Join à¤à¤°à¥à¤ / Please Join Channel First", show_alert=True)
+
+
+@router.callback_query(F.data == "how_to_buy")
+async def how_to_buy(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "ð <b>à¤à¥à¤¸à¥ à¤à¤°à¥à¤¦à¥à¤? / How to Buy?</b>\n\n"
+        "1ï¸â£ à¤à¥à¤¨à¤² à¤à¥à¤à¥à¤ / Channel Search à¤¦à¤¬à¤¾à¤à¤à¥¤\n"
+        "2ï¸â£ à¤à¤ªà¤¨à¤¾ Course à¤à¥à¤¨à¥à¤à¥¤\n"
+        "3ï¸â£ ð¬ Demo à¤¦à¥à¤à¥à¤à¥¤\n"
+        "4ï¸â£ ð Buy Now / Purchase à¤ªà¤° à¤à¥à¤²à¤¿à¤ à¤à¤°à¥à¤à¥¤\n"
+        "5ï¸â£ Razorpay Payment à¤ªà¥à¤°à¤¾ à¤à¤°à¥à¤à¥¤\n"
+        "6ï¸â£ Payment successful à¤¹à¥à¤¨à¥ à¤à¥ à¤¬à¤¾à¤¦ Premium Access à¤®à¤¿à¤²à¥à¤à¤¾à¥¤",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ð à¤µà¤¾à¤ªà¤¸ / Back", callback_data="user_home")]]),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "user_home")
+async def user_home(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "ð <b>Course Purchase Bot</b>\n\nð Choose an option / à¤µà¤¿à¤à¤²à¥à¤ª à¤à¥à¤¨à¥à¤:",
+        reply_markup=user_home_kb(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "purchase_history")
+async def purchase_history(callback: CallbackQuery):
+    await callback.answer()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT course_name,amount,status,created_at FROM payments WHERE user_id=? ORDER BY id DESC LIMIT 20",
+            (callback.from_user.id,)
+        )
+        rows = await cur.fetchall()
+    if not rows:
+        text = "ð§¾ <b>à¤à¤°à¥à¤¦à¤¾à¤°à¥ à¤à¤¤à¤¿à¤¹à¤¾à¤¸ / Purchase History</b>\n\nà¤à¤­à¥ à¤à¥à¤ purchase à¤¨à¤¹à¥à¤ à¤¹à¥à¥¤"
+    else:
+        lines = ["ð§¾ <b>à¤à¤°à¥à¤¦à¤¾à¤°à¥ à¤à¤¤à¤¿à¤¹à¤¾à¤¸ / Purchase History</b>", ""]
+        for name, amount, status, created in rows:
+            icon = "â" if status == "paid" else "â³"
+            lines.append(f"{icon} <b>{clean_html(name)}</b> â {money(amount)} â {status}")
+        text = "\n".join(lines)
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="ð à¤µà¤¾à¤ªà¤¸ / Back", callback_data="user_home")]]), parse_mode="HTML")
+
+
 
 @router.message(Command("start"))
 async def start(message: Message):
     await upsert_user(message.from_user)
-    parts = (message.text or "").split(maxsplit=1)
 
+    if not await is_force_joined(message.from_user.id):
+        await send_join_screen(message)
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2 and parts[1].startswith("course_"):
         try:
             channel_id = int(parts[1].split("_", 1)[1])
         except ValueError:
             channel_id = 0
-
         course = await get_course(channel_id)
         if course:
             demo = await get_demo_minutes()
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=f"🎁 {demo} Min Demo", callback_data=f"demo:{channel_id}")],
-                [InlineKeyboardButton(text=f"💳 Buy Now {money(course[4])}", callback_data=f"buy:{channel_id}")]
+                [InlineKeyboardButton(text=f"ð¬ à¤¡à¥à¤®à¥ à¤¦à¥à¤à¥à¤ / Watch Demo ({demo} Min)", callback_data=f"demo:{channel_id}")],
+                [InlineKeyboardButton(text=f"ð à¤à¥à¤°à¥à¤¸ à¤à¤°à¥à¤¦à¥à¤ / Purchase {money(course[4])}", callback_data=f"buy:{channel_id}")]
             ])
             await message.answer(
-                f"📚 <b>{clean_html(course[3])}</b>\n\n"
-                f"💰 Price: <b>{money(course[4])}</b>\n"
-                f"🎁 Demo: <b>{demo} मिनट</b>",
+                f"ð <b>{clean_html(course[3])}</b>\n\n"
+                f"ð° Price / à¤à¥à¤®à¤¤: <b>{money(course[4])}</b>\n"
+                f"ð Demo: <b>{demo} à¤®à¤¿à¤¨à¤</b>",
                 reply_markup=kb, parse_mode="HTML"
             )
             return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="🔎 चैनल सर्च करें",
-            switch_inline_query_current_chat=""
-        )
-    ]])
     await message.answer(
-        "👋 <b>COURSE DEMO BOT</b>\n\n🔎 नीचे से course/channel search करें।",
-        reply_markup=kb, parse_mode="HTML"
+        "ð <b>Welcome / à¤¸à¥à¤µà¤¾à¤à¤¤ à¤¹à¥!</b>\n\n"
+        "Course/Channel à¤à¥à¤à¥à¤, Demo à¤¦à¥à¤à¥à¤ à¤à¤° à¤à¤¸à¤¾à¤¨à¥ à¤¸à¥ Purchase à¤à¤°à¥à¤à¥¤",
+        reply_markup=user_home_kb(),
+        parse_mode="HTML"
     )
 
 
 @router.inline_query()
 async def inline_search(query: InlineQuery):
     await upsert_user(query.from_user)
+    if not await is_force_joined(query.from_user.id):
+        await query.answer([], cache_time=0, is_personal=True, switch_pm_text="ð¢ à¤ªà¤¹à¤²à¥ Channel Join à¤à¤°à¥à¤ / Join Channel", switch_pm_parameter="join")
+        return
     q = (query.query or "").strip().lower()
     courses = await get_courses()
     if q:
@@ -430,17 +558,17 @@ async def inline_search(query: InlineQuery):
             InlineQueryResultArticle(
                 id=f"course_{channel_id}",
                 title=course_name,
-                description=f"{money(price)} • Demo available",
+                description=f"{money(price)} â¢ Demo available",
                 input_message_content=InputTextMessageContent(
                     message_text=(
-                        f"📚 <b>{clean_html(course_name)}</b>\n"
-                        f"💰 <b>{money(price)}</b>\n\n"
-                        f"🎁 Demo / Buy: {link}"
+                        f"ð <b>{clean_html(course_name)}</b>\n"
+                        f"ð° <b>{money(price)}</b>\n\n"
+                        f"ð Demo / Buy: {link}"
                     ),
                     parse_mode="HTML"
                 ),
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="🎁 Demo / Buy", url=link)
+                    InlineKeyboardButton(text="ð Demo / Buy", url=link)
                 ]])
             )
         )
@@ -458,11 +586,11 @@ async def detect_channel(chat):
     new = await add_channel(chat)
     if new:
         await owner_notify(
-            "✅ <b>CHANNEL AUTO ADDED</b>\n\n"
-            f"📚 <b>{clean_html(chat.title)}</b>\n"
-            f"📌 <code>{chat.id}</code>\n"
-            "🎁 Demo: ON\n"
-            "💳 Payment: ON"
+            "â <b>CHANNEL AUTO ADDED</b>\n\n"
+            f"ð <b>{clean_html(chat.title)}</b>\n"
+            f"ð <code>{chat.id}</code>\n"
+            "ð Demo: ON\n"
+            "ð³ Payment: ON"
         )
 
 
@@ -499,7 +627,7 @@ async def demo(callback: CallbackQuery):
     course = await get_course(channel_id)
 
     if not course:
-        await callback.answer("❌ Course नहीं मिला", show_alert=True)
+        await callback.answer("â Course à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾", show_alert=True)
         return
 
     try:
@@ -510,7 +638,7 @@ async def demo(callback: CallbackQuery):
     except Exception as e:
         print("DEMO ADMIN:", e)
         await callback.answer(
-            "❌ Bot को channel में administrator बनाओ और Invite Users + Ban Users permission दो।",
+            "â Bot à¤à¥ channel à¤®à¥à¤ administrator à¤¬à¤¨à¤¾à¤ à¤à¤° Invite Users + Ban Users permission à¤¦à¥à¥¤",
             show_alert=True
         )
         return
@@ -526,7 +654,7 @@ async def demo(callback: CallbackQuery):
         )
     except Exception as e:
         print("DEMO LINK:", e)
-        await callback.answer("❌ Demo link generate नहीं हुआ।", show_alert=True)
+        await callback.answer("â Demo link generate à¤¨à¤¹à¥à¤ à¤¹à¥à¤à¥¤", show_alert=True)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -541,11 +669,11 @@ async def demo(callback: CallbackQuery):
         await db.commit()
 
     await callback.message.answer(
-        f"🎁 <b>DEMO READY</b>\n\n"
-        f"📚 {clean_html(course[3])}\n"
-        f"⏱ {demo_minutes} मिनट\n\n"
-        f"🔗 <a href=\"{invite.invite_link}\">👉 JOIN DEMO CHANNEL</a>\n\n"
-        "⚠️ Demo खत्म होने पर access automatically remove होगा।",
+        f"ð <b>DEMO READY</b>\n\n"
+        f"ð {clean_html(course[3])}\n"
+        f"â± {demo_minutes} à¤®à¤¿à¤¨à¤\n\n"
+        f"ð <a href=\"{invite.invite_link}\">ð JOIN DEMO CHANNEL</a>\n\n"
+        "â ï¸ Demo à¤à¤¤à¥à¤® à¤¹à¥à¤¨à¥ à¤ªà¤° access automatically remove à¤¹à¥à¤à¤¾à¥¤",
         parse_mode="HTML"
     )
     await callback.answer()
@@ -557,151 +685,194 @@ async def demo(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("buy:"))
 async def buy(callback: CallbackQuery):
-    await upsert_user(callback.from_user)
-    channel_id = int(callback.data.split(":", 1)[1])
-    course = await get_course(channel_id)
+    # Answer immediately so Telegram never leaves the button in a spinner/frozen state.
+    await callback.answer()
 
+    await upsert_user(callback.from_user)
+    try:
+        channel_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.message.answer("â Invalid course.")
+        return
+
+    course = await get_course(channel_id)
     if not course:
-        await callback.answer("❌ Course नहीं मिला", show_alert=True)
+        await callback.message.answer("â Course à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾à¥¤")
         return
 
     user = callback.from_user
-    reference = f"TG{user.id}{int(datetime.now().timestamp())}"[:40]
+    amount = int(course[4])
+    if amount < 100:
+        await callback.message.answer("â Course price â¹1 à¤¸à¥ à¤à¤® à¤¨à¤¹à¥à¤ à¤¹à¥ à¤¸à¤à¤¤à¥à¥¤ Owner Panel à¤®à¥à¤ price à¤ à¥à¤ à¤à¤°à¥à¤à¥¤")
+        return
+
+    # Razorpay reference_id must be unique. UUID avoids duplicate clicks in the same second.
+    reference = f"TG{user.id}_{uuid.uuid4().hex[:18]}"[:40]
+
+    payload = {
+        "amount": amount,
+        "currency": "INR",
+        "accept_partial": False,
+        "description": f"{str(course[3])[:240]} Telegram Access",
+        "reference_id": reference,
+        "reminder_enable": False,
+        "notes": {
+            "telegram_user_id": str(user.id),
+            "channel_id": str(channel_id)
+        }
+    }
 
     try:
-        pl = await razorpay("POST", "/payment_links", {
-            "amount": course[4],
-            "currency": "INR",
-            "accept_partial": False,
-            "description": f"{course[3]} Telegram Access",
-            "reference_id": reference,
-            "customer": {"name": (user.full_name or "Telegram User")[:100]},
-            "notify": {"sms": False, "email": False},
-            "reminder_enable": False,
-            "notes": {
-                "telegram_user_id": str(user.id),
-                "channel_id": str(channel_id)
-            }
-        })
+        payment_link = await razorpay("POST", "/payment_links", payload)
     except Exception as e:
-        print("RAZORPAY CREATE:", e)
-        await callback.answer("❌ Payment link नहीं बना।", show_alert=True)
+        print("RAZORPAY CREATE ERROR:", e)
+        await owner_notify(
+            "â ï¸ <b>RAZORPAY PAYMENT LINK ERROR</b>\n\n"
+            f"ð¤ User: <code>{user.id}</code>\n"
+            f"ð Course: <b>{clean_html(course[3])}</b>\n"
+            f"ð° Amount: <b>{money(amount)}</b>\n"
+            f"â <code>{clean_html(str(e)[:2500])}</code>"
+        )
+        await callback.message.answer(
+            "â Payment link à¤¨à¤¹à¥à¤ à¤¬à¤¨ à¤ªà¤¾à¤¯à¤¾à¥¤\n\n"
+            "Owner à¤à¥ exact Razorpay error à¤­à¥à¤ à¤¦à¤¿à¤¯à¤¾ à¤à¤¯à¤¾ à¤¹à¥à¥¤"
+        )
         return
 
-    link_id = pl.get("id")
-    short_url = pl.get("short_url")
-
+    link_id = payment_link.get("id")
+    short_url = payment_link.get("short_url")
     if not link_id or not short_url:
-        await callback.answer("❌ Razorpay response invalid.", show_alert=True)
+        await owner_notify(
+            "â ï¸ <b>RAZORPAY INVALID RESPONSE</b>\n\n"
+            f"<code>{clean_html(json.dumps(payment_link)[:3000])}</code>"
+        )
+        await callback.message.answer("â Razorpay à¤¨à¥ valid payment link à¤¨à¤¹à¥à¤ à¤¦à¤¿à¤¯à¤¾à¥¤")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO payments(
-                user_id,channel_id,course_name,amount,link_id,reference_id,status,created_at
-            ) VALUES(?,?,?,?,?,?,?,?)
-        """, (
-            user.id, channel_id, course[3], course[4],
-            link_id, reference, "created", now_iso()
-        ))
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                INSERT INTO payments(
+                    user_id,channel_id,course_name,amount,link_id,reference_id,status,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+            """, (
+                user.id, channel_id, course[3], amount,
+                link_id, reference, "created", now_iso()
+            ))
+            await db.commit()
+    except Exception as e:
+        print("PAYMENT DB ERROR:", e)
+        await callback.message.answer("â Payment record save à¤¨à¤¹à¥à¤ à¤¹à¥ à¤ªà¤¾à¤¯à¤¾à¥¤")
+        return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 PAY {money(course[4])}", url=short_url)],
-        [InlineKeyboardButton(text="🔄 Check Payment", callback_data=f"check:{link_id}")]
+        [InlineKeyboardButton(text=f"ð³ PAY {money(amount)} / à¤­à¥à¤à¤¤à¤¾à¤¨ à¤à¤°à¥à¤", url=short_url)],
+        [InlineKeyboardButton(text="ð Payment Check / à¤­à¥à¤à¤¤à¤¾à¤¨ à¤à¤¾à¤à¤à¥à¤", callback_data=f"check:{link_id}")]
     ])
 
     await callback.message.answer(
-        f"💳 <b>PAYMENT</b>\n\n"
-        f"📚 {clean_html(course[3])}\n"
-        f"💰 <b>{money(course[4])}</b>\n\n"
-        "Payment के बाद Check Payment दबाएँ।",
-        reply_markup=kb, parse_mode="HTML"
+        "ð³ <b>PAYMENT / à¤­à¥à¤à¤¤à¤¾à¤¨</b>\n\n"
+        f"ð <b>{clean_html(course[3])}</b>\n"
+        f"ð° Amount: <b>{money(amount)}</b>\n\n"
+        "à¤¨à¥à¤à¥ <b>PAY</b> button à¤¦à¤¬à¤¾à¤à¤° Razorpay payment à¤ªà¥à¤°à¤¾ à¤à¤°à¥à¤à¥¤\n"
+        "Payment à¤à¥ à¤¬à¤¾à¤¦ <b>Payment Check</b> à¤¦à¤¬à¤¾à¤à¤à¥¤",
+        reply_markup=kb,
+        parse_mode="HTML",
+        disable_web_page_preview=True
     )
-    await callback.answer()
 
 
 async def process_payment(link_id):
+    if link_id in processing_payments:
+        return False
+
+    processing_payments.add(link_id)
     try:
-        pl = await razorpay("GET", f"/payment_links/{link_id}")
-    except Exception as e:
-        print("PAYMENT VERIFY:", e)
-        return False
-
-    if pl.get("status") != "paid":
-        return False
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            SELECT id,user_id,channel_id,course_name,amount,status
-            FROM payments WHERE link_id=?
-        """, (link_id,))
-        row = await cur.fetchone()
-        if not row:
+        try:
+            pl = await razorpay("GET", f"/payment_links/{link_id}")
+        except Exception as e:
+            print("PAYMENT VERIFY:", e)
             return False
 
-        db_id, user_id, channel_id, course_name, amount, status = row
-        if status == "paid":
-            return True
+        if pl.get("status") != "paid":
+            return False
 
-        await db.execute(
-            "UPDATE payments SET status='paid',paid_at=? WHERE id=?",
-            (now_iso(), db_id)
-        )
-        await db.execute(
-            "UPDATE users SET purchase_count=purchase_count+1 WHERE user_id=?",
-            (user_id,)
-        )
-        await db.commit()
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("""
+                SELECT id,user_id,channel_id,course_name,amount,status
+                FROM payments WHERE link_id=?
+            """, (link_id,))
+            row = await cur.fetchone()
+            if not row:
+                print("PAYMENT DB RECORD NOT FOUND:", link_id)
+                return False
 
-    try:
-        invite = await bot.create_chat_invite_link(
-            chat_id=channel_id,
-            member_limit=1,
-            expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
-            name=f"Paid-{user_id}"
-        )
-    except Exception as e:
+            db_id, user_id, channel_id, course_name, amount, status = row
+            if status == "paid":
+                return True
+
+            await db.execute(
+                "UPDATE payments SET status='paid',paid_at=? WHERE id=? AND status='created'",
+                (now_iso(), db_id)
+            )
+            await db.execute(
+                "UPDATE users SET purchase_count=purchase_count+1 WHERE user_id=?",
+                (user_id,)
+            )
+            await db.commit()
+
+        try:
+            invite = await bot.create_chat_invite_link(
+                chat_id=channel_id,
+                member_limit=1,
+                expire_date=datetime.now(timezone.utc) + timedelta(minutes=10),
+                name=f"Paid-{user_id}"
+            )
+        except Exception as e:
+            await owner_notify(
+                "â ï¸ <b>PAYMENT SUCCESS / INVITE ERROR</b>\n\n"
+                f"ð¤ <code>{user_id}</code>\n"
+                f"ð {clean_html(course_name)}\n"
+                f"ð° {money(amount)}\n"
+                f"â <code>{clean_html(str(e)[:1500])}</code>"
+            )
+            return False
+
+        await add_grant(user_id, channel_id, course_name, invite.invite_link)
+
+        try:
+            await bot.send_message(
+                user_id,
+                "ð <b>PAYMENT SUCCESSFUL</b>\n\n"
+                f"ð {clean_html(course_name)}\n"
+                f"ð° Paid: <b>{money(amount)}</b>\n\n"
+                f"ð <a href=\"{invite.invite_link}\">ð JOIN PREMIUM CHANNEL</a>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print("BUYER MESSAGE:", e)
+
         await owner_notify(
-            "⚠️ <b>PAYMENT SUCCESS / INVITE ERROR</b>\n\n"
-            f"👤 <code>{user_id}</code>\n"
-            f"📚 {clean_html(course_name)}\n"
-            f"💰 {money(amount)}\n"
-            f"❌ <code>{clean_html(str(e)[:1500])}</code>"
+            "ð <b>PURCHASE SUCCESSFUL</b>\n\n"
+            f"ð¤ User: <code>{user_id}</code>\n"
+            f"ð <b>{clean_html(course_name)}</b>\n"
+            f"ð° <b>{money(amount)}</b>\n"
+            f"ð³ <code>{link_id}</code>"
         )
-        return False
-
-    await add_grant(user_id, channel_id, course_name, invite.invite_link)
-
-    try:
-        await bot.send_message(
-            user_id,
-            "🎉 <b>PAYMENT SUCCESSFUL</b>\n\n"
-            f"📚 {clean_html(course_name)}\n"
-            f"💰 Paid: <b>{money(amount)}</b>\n\n"
-            f"🔗 <a href=\"{invite.invite_link}\">👉 JOIN PREMIUM CHANNEL</a>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        print("BUYER MESSAGE:", e)
-
-    await owner_notify(
-        "🎉 <b>PURCHASE SUCCESSFUL</b>\n\n"
-        f"👤 User: <code>{user_id}</code>\n"
-        f"📚 <b>{clean_html(course_name)}</b>\n"
-        f"💰 <b>{money(amount)}</b>\n"
-        f"💳 <code>{link_id}</code>"
-    )
-    return True
+        return True
+    finally:
+        processing_payments.discard(link_id)
 
 
 @router.callback_query(F.data.startswith("check:"))
 async def check_payment(callback: CallbackQuery):
+    # Immediately stop Telegram's loading spinner.
+    await callback.answer("â³ Payment check à¤¹à¥ à¤°à¤¹à¤¾ à¤¹à¥â¦")
     link_id = callback.data.split(":", 1)[1]
     ok = await process_payment(link_id)
-    await callback.answer(
-        "✅ Payment verified!" if ok else "⏳ Payment अभी verified नहीं हुआ।",
-        show_alert=True
+    await callback.message.answer(
+        "â Payment verified! Access link à¤­à¥à¤ à¤¦à¤¿à¤¯à¤¾ à¤à¤¯à¤¾ à¤¹à¥à¥¤" if ok
+        else "â³ Payment à¤à¤­à¥ verified à¤¨à¤¹à¥à¤ à¤¹à¥à¤à¥¤ Payment complete à¤¹à¥à¤¨à¥ à¤à¥ à¤¬à¤¾à¤¦ à¤«à¤¿à¤° Check à¤à¤°à¥à¤à¥¤"
     )
 
 
@@ -822,60 +993,65 @@ async def member_join(event: ChatMemberUpdated):
 def owner_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="👥 Users Data", callback_data="own:users"),
-            InlineKeyboardButton(text="⏱ Demo Time", callback_data="own:demo")
+            InlineKeyboardButton(text="ð¥ Users Data", callback_data="own:users"),
+            InlineKeyboardButton(text="â± Demo Time", callback_data="own:demo")
         ],
         [
-            InlineKeyboardButton(text="💰 Course Prices", callback_data="own:prices"),
-            InlineKeyboardButton(text="📊 My Reports", callback_data="own:reports")
+            InlineKeyboardButton(text="ð° Course Prices", callback_data="own:prices"),
+            InlineKeyboardButton(text="ð My Reports", callback_data="own:reports")
         ],
         [
-            InlineKeyboardButton(text="👤 Manage Members", callback_data="own:members")
+            InlineKeyboardButton(text="ð¤ Manage Members", callback_data="own:members")
         ]
     ])
 
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Owner Panel", callback_data="own:home")]
+        [InlineKeyboardButton(text="â¬ï¸ Owner Panel", callback_data="own:home")]
     ])
 
 
-def prices_kb(courses):
+def prices_kb(courses, page=0):
+    # Keep the keyboard small so Telegram edit/send never hangs with many channels.
+    per_page = 8
+    total_pages = max(1, (len(courses) + per_page - 1) // per_page)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * per_page
+    visible = courses[start:start + per_page]
+
     rows = [
         [InlineKeyboardButton(
-            text="🌐 ALL CHANNELS — SET SAME PRICE",
+            text="ð à¤¸à¤­à¥ à¤à¥à¤¨à¤² â à¤à¤ à¤¹à¥ Price / Set Same Price",
             callback_data="prices:all"
         )],
         [
-            InlineKeyboardButton(
-                text="📈 ALL +₹50",
-                callback_data="prices:all_delta:50"
-            ),
-            InlineKeyboardButton(
-                text="📉 ALL -₹50",
-                callback_data="prices:all_delta:-50"
-            )
+            InlineKeyboardButton(text="ð à¤¸à¤­à¥ +â¹50 / All +â¹50", callback_data="prices:all_delta:50"),
+            InlineKeyboardButton(text="ð à¤¸à¤­à¥ -â¹50 / All -â¹50", callback_data="prices:all_delta:-50")
         ],
-        [
-            InlineKeyboardButton(
-                text="✏️ MANUAL PRICE",
-                callback_data="prices:manual"
-            )
-        ]
+        [InlineKeyboardButton(
+            text="âï¸ Manual Price / à¤®à¥à¤¨à¥à¤à¤² Price",
+            callback_data="prices:manual"
+        )]
     ]
 
-    for channel_id, _, _, course_name, price in courses:
-        rows.append([
-            InlineKeyboardButton(
-                text=f"📚 {course_name} • {money(price)}",
-                callback_data=f"price:course:{channel_id}"
-            )
-        ])
+    for channel_id, _, _, course_name, price in visible:
+        label = str(course_name or "Course")
+        if len(label) > 35:
+            label = label[:32] + "..."
+        rows.append([InlineKeyboardButton(
+            text=f"ð {label} â¢ {money(price)}",
+            callback_data=f"price:course:{channel_id}"
+        )])
 
-    rows.append([
-        InlineKeyboardButton(text="⬅️ Owner Panel", callback_data="own:home")
-    ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="â¬ï¸ Previous", callback_data=f"own:prices:{page-1}"))
+    nav.append(InlineKeyboardButton(text=f"ð {page+1}/{total_pages}", callback_data="price:nop"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="Next â¡ï¸", callback_data=f"own:prices:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text="â¬ï¸ Owner Panel", callback_data="own:home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -883,37 +1059,37 @@ def course_price_kb(channel_id, price_rupees):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="➖ ₹50",
+                text="â â¹50",
                 callback_data=f"price:delta:{channel_id}:-50"
             ),
             InlineKeyboardButton(
-                text=f"₹{price_rupees}",
+                text=f"â¹{price_rupees}",
                 callback_data="price:nop"
             ),
             InlineKeyboardButton(
-                text="➕ ₹50",
+                text="â â¹50",
                 callback_data=f"price:delta:{channel_id}:50"
             )
         ],
         [
             InlineKeyboardButton(
-                text="➖ ₹100",
+                text="â â¹100",
                 callback_data=f"price:delta:{channel_id}:-100"
             ),
             InlineKeyboardButton(
-                text="➕ ₹100",
+                text="â â¹100",
                 callback_data=f"price:delta:{channel_id}:100"
             )
         ],
         [
             InlineKeyboardButton(
-                text="✏️ MANUAL PRICE",
+                text="âï¸ MANUAL PRICE",
                 callback_data=f"price:manual_course:{channel_id}"
             )
         ],
         [
             InlineKeyboardButton(
-                text="⬅️ All Prices",
+                text="â¬ï¸ All Prices",
                 callback_data="own:prices"
             )
         ]
@@ -923,16 +1099,16 @@ def course_price_kb(channel_id, price_rupees):
 def demo_kb(minutes):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="➖ 5", callback_data="demo_time:-5"),
-            InlineKeyboardButton(text=f"⏱ {minutes} Min", callback_data="demo_time:0"),
-            InlineKeyboardButton(text="➕ 5", callback_data="demo_time:5")
+            InlineKeyboardButton(text="â 5", callback_data="demo_time:-5"),
+            InlineKeyboardButton(text=f"â± {minutes} Min", callback_data="demo_time:0"),
+            InlineKeyboardButton(text="â 5", callback_data="demo_time:5")
         ],
         [
-            InlineKeyboardButton(text="➖ 1", callback_data="demo_time:-1"),
-            InlineKeyboardButton(text="➕ 1", callback_data="demo_time:1")
+            InlineKeyboardButton(text="â 1", callback_data="demo_time:-1"),
+            InlineKeyboardButton(text="â 1", callback_data="demo_time:1")
         ],
         [
-            InlineKeyboardButton(text="⬅️ Owner Panel", callback_data="own:home")
+            InlineKeyboardButton(text="â¬ï¸ Owner Panel", callback_data="own:home")
         ]
     ])
 
@@ -940,12 +1116,12 @@ def demo_kb(minutes):
 @router.message(Command("owner"))
 async def owner(message: Message):
     if not await owner_only(message.from_user.id):
-        await message.answer("❌ Owner only.")
+        await message.answer("â Owner only.")
         return
 
     await message.answer(
-        "👑 <b>OWNER PANEL</b>\n\n"
-        "नीचे से option चुनें:",
+        "ð <b>OWNER PANEL</b>\n\n"
+        "à¤¨à¥à¤à¥ à¤¸à¥ option à¤à¥à¤¨à¥à¤:",
         reply_markup=owner_main_kb(),
         parse_mode="HTML"
     )
@@ -959,34 +1135,42 @@ async def panel(message: Message):
 @router.callback_query(F.data.startswith("own:"))
 async def owner_menu(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
 
+    # Acknowledge immediately to prevent Telegram's callback spinner/freeze.
+    await callback.answer()
     action = callback.data.split(":", 1)[1]
 
     if action == "home":
         await callback.message.edit_text(
-            "👑 <b>OWNER PANEL</b>\n\nनीचे से option चुनें:",
+            "ð <b>OWNER PANEL</b>\n\nà¤¨à¥à¤à¥ à¤¸à¥ option à¤à¥à¤¨à¥à¤:",
             reply_markup=owner_main_kb(),
             parse_mode="HTML"
         )
 
-    elif action == "prices":
+    elif action == "prices" or action.startswith("prices:"):
         courses = await get_courses()
+        page = 0
+        if action.startswith("prices:"):
+            try:
+                page = int(action.split(":", 1)[1])
+            except ValueError:
+                page = 0
         await callback.message.edit_text(
-            "💰 <b>COURSE PRICE MANAGER</b>\n\n"
-            "🌐 <b>ALL CHANNELS</b> से एक साथ सभी prices बदल सकते हो।\n"
-            "✏️ <b>MANUAL PRICE</b> से किसी भी course की exact price डाल सकते हो।\n\n"
-            "नीचे option चुनें:",
-            reply_markup=prices_kb(courses),
+            "ð° <b>COURSE PRICE MANAGER</b>\n\n"
+            "ð à¤¸à¤­à¥ channels à¤à¥ price à¤à¤ à¤¸à¤¾à¤¥ à¤¬à¤¦à¤² à¤¸à¤à¤¤à¥ à¤¹à¥à¥¤\n"
+            "âï¸ à¤à¤¿à¤¸à¥ à¤à¤ course à¤à¥ exact price à¤­à¥ à¤¬à¤¦à¤² à¤¸à¤à¤¤à¥ à¤¹à¥à¥¤\n\n"
+            f"ð Total Courses: <b>{len(courses)}</b>",
+            reply_markup=prices_kb(courses, page),
             parse_mode="HTML"
         )
 
     elif action == "demo":
         minutes = await get_demo_minutes()
         await callback.message.edit_text(
-            f"⏱ <b>DEMO TIME</b>\n\n"
-            f"Current: <b>{minutes} मिनट</b>",
+            f"â± <b>DEMO TIME</b>\n\n"
+            f"Current: <b>{minutes} à¤®à¤¿à¤¨à¤</b>",
             reply_markup=demo_kb(minutes),
             parse_mode="HTML"
         )
@@ -994,13 +1178,13 @@ async def owner_menu(callback: CallbackQuery):
     elif action == "reports":
         users, purchases, revenue, channels, members, demos = await stats()
         await callback.message.edit_text(
-            "📊 <b>MY REPORTS</b>\n\n"
-            f"👥 Users: <b>{users}</b>\n"
-            f"🛒 Successful Purchases: <b>{purchases}</b>\n"
-            f"💰 Revenue: <b>{money(revenue)}</b>\n"
-            f"📚 Channels: <b>{channels}</b>\n"
-            f"👤 Active Granted Members: <b>{members}</b>\n"
-            f"🎁 Active Demos: <b>{demos}</b>",
+            "ð <b>MY REPORTS</b>\n\n"
+            f"ð¥ Users: <b>{users}</b>\n"
+            f"ð Successful Purchases: <b>{purchases}</b>\n"
+            f"ð° Revenue: <b>{money(revenue)}</b>\n"
+            f"ð Channels: <b>{channels}</b>\n"
+            f"ð¤ Active Granted Members: <b>{members}</b>\n"
+            f"ð Active Demos: <b>{demos}</b>",
             reply_markup=back_kb(),
             parse_mode="HTML"
         )
@@ -1013,16 +1197,16 @@ async def owner_menu(callback: CallbackQuery):
             """)
             rows = await cur.fetchall()
 
-        text = "👥 <b>USERS DATA</b>\n\n"
+        text = "ð¥ <b>USERS DATA</b>\n\n"
         if not rows:
             text += "No users yet."
         else:
             for uid, username, full_name, demos, purchases, last_seen in rows:
                 text += (
-                    f"👤 <b>{clean_html(full_name or 'Unknown')}</b>\n"
-                    f"🆔 <code>{uid}</code>\n"
-                    f"🔗 @{clean_html(username or 'none')}\n"
-                    f"🎁 Demo: {demos} | 🛒 Purchases: {purchases}\n\n"
+                    f"ð¤ <b>{clean_html(full_name or 'Unknown')}</b>\n"
+                    f"ð <code>{uid}</code>\n"
+                    f"ð @{clean_html(username or 'none')}\n"
+                    f"ð Demo: {demos} | ð Purchases: {purchases}\n\n"
                 )
 
         await callback.message.edit_text(
@@ -1033,45 +1217,43 @@ async def owner_menu(callback: CallbackQuery):
 
     elif action == "members":
         rows = await get_members()
-        text = "👤 <b>MANAGE MEMBERS</b>\n\n"
+        text = "ð¤ <b>MANAGE MEMBERS</b>\n\n"
         buttons = []
 
         if not rows:
             text += "No bot-granted members yet."
         else:
             for gid, uid, cid, cname, invite, status, granted, revoked in rows:
-                icon = "🟢" if status == "active" else "🔴"
+                icon = "ð¢" if status == "active" else "ð´"
                 text += (
                     f"{icon} <b>{clean_html(cname)}</b>\n"
-                    f"👤 <code>{uid}</code>\n"
-                    f"📌 <code>{cid}</code>\n"
+                    f"ð¤ <code>{uid}</code>\n"
+                    f"ð <code>{cid}</code>\n"
                     f"Status: <b>{status}</b>\n\n"
                 )
                 if status == "active":
                     buttons.append([
                         InlineKeyboardButton(
-                            text=f"🚫 Ban {uid}",
+                            text=f"ð« Ban {uid}",
                             callback_data=f"member:ban:{gid}"
                         )
                     ])
                 else:
                     buttons.append([
                         InlineKeyboardButton(
-                            text=f"♻️ Unban {uid}",
+                            text=f"â»ï¸ Unban {uid}",
                             callback_data=f"member:unban:{gid}"
                         )
                     ])
 
         buttons.append([
-            InlineKeyboardButton(text="⬅️ Owner Panel", callback_data="own:home")
+            InlineKeyboardButton(text="â¬ï¸ Owner Panel", callback_data="own:home")
         ])
         await callback.message.edit_text(
             text[:4000],
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode="HTML"
         )
-
-    await callback.answer()
 
 
 # ============================================================
@@ -1081,40 +1263,41 @@ async def owner_menu(callback: CallbackQuery):
 @router.callback_query(F.data == "prices:all")
 async def all_price_start(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
-    all_price_mode.add(callback.from_user.id)
+    uid = callback.from_user.id
+    all_price_mode.add(uid)
+    manual_price_mode.discard(uid)
+    for item in list(manual_price_mode):
+        if isinstance(item, tuple) and item[0] == uid:
+            manual_price_mode.discard(item)
 
     await callback.message.answer(
-        "🌐 <b>ALL CHANNELS PRICE</b>\n\n"
-        "अब सिर्फ एक message में नई price भेजो।\n\n"
+        "ð <b>ALL CHANNELS PRICE</b>\n\n"
+        "à¤à¤¬ à¤¸à¤¿à¤°à¥à¤« à¤à¤ message à¤®à¥à¤ à¤¨à¤ price à¤­à¥à¤à¥à¥¤\n\n"
         "Example:\n"
         "<code>499</code>\n\n"
-        "इससे <b>सभी channels</b> की price ₹499 हो जाएगी।",
+        "à¤à¤¸à¤¸à¥ <b>à¤¸à¤­à¥ channels</b> à¤à¥ price â¹499 à¤¹à¥ à¤à¤¾à¤à¤à¥à¥¤",
         parse_mode="HTML"
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("prices:all_delta:"))
 async def all_delta(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
     delta = int(callback.data.rsplit(":", 1)[1])
     count = await change_all_prices(delta)
 
-    await callback.answer(
-        f"✅ {count} channels updated.",
-        show_alert=True
-    )
-
     courses = await get_courses()
     await callback.message.edit_text(
-        f"✅ <b>ALL CHANNEL PRICES UPDATED</b>\n\n"
-        f"Action: {'+' if delta > 0 else ''}{delta}₹\n"
+        f"â <b>ALL CHANNEL PRICES UPDATED</b>\n\n"
+        f"Action: {'+' if delta > 0 else ''}{delta}â¹\n"
         f"Channels: <b>{count}</b>",
         reply_markup=prices_kb(courses),
         parse_mode="HTML"
@@ -1124,52 +1307,58 @@ async def all_delta(callback: CallbackQuery):
 @router.callback_query(F.data == "prices:manual")
 async def manual_price_start(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
-    manual_price_mode.add(callback.from_user.id)
+    uid = callback.from_user.id
+    all_price_mode.discard(uid)
+    for item in list(manual_price_mode):
+        if isinstance(item, tuple) and item[0] == uid:
+            manual_price_mode.discard(item)
+    manual_price_mode.add(uid)
 
     await callback.message.answer(
-        "✏️ <b>MANUAL PRICE</b>\n\n"
-        "इस format में भेजो:\n\n"
+        "âï¸ <b>MANUAL PRICE</b>\n\n"
+        "à¤à¤¸ format à¤®à¥à¤ à¤­à¥à¤à¥:\n\n"
         "<code>CHANNEL_ID PRICE</code>\n\n"
         "Example:\n"
         "<code>-1001234567890 599</code>\n\n"
-        "इससे सिर्फ उस course की exact price ₹599 होगी।",
+        "à¤à¤¸à¤¸à¥ à¤¸à¤¿à¤°à¥à¤« à¤à¤¸ course à¤à¥ exact price â¹599 à¤¹à¥à¤à¥à¥¤",
         parse_mode="HTML"
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("price:course:"))
 async def course_price(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
     channel_id = int(callback.data.rsplit(":", 1)[1])
     course = await get_course(channel_id)
 
     if not course:
-        await callback.answer("❌ Course नहीं मिला.", show_alert=True)
+        await callback.message.answer("â Course à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾à¥¤")
         return
 
     await callback.message.edit_text(
-        "💰 <b>COURSE PRICE</b>\n\n"
-        f"📚 <b>{clean_html(course[3])}</b>\n"
+        "ð° <b>COURSE PRICE</b>\n\n"
+        f"ð <b>{clean_html(course[3])}</b>\n"
         f"Current: <b>{money(course[4])}</b>\n\n"
-        "➕/➖ से price बदलें या Manual Price चुनें।",
+        "â/â à¤¸à¥ price à¤¬à¤¦à¤²à¥à¤ à¤¯à¤¾ Manual Price à¤à¥à¤¨à¥à¤à¥¤",
         reply_markup=course_price_kb(channel_id, course[4] // 100),
         parse_mode="HTML"
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("price:delta:"))
 async def course_delta(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
     _, _, channel_id, delta = callback.data.split(":")
     channel_id = int(channel_id)
@@ -1177,37 +1366,42 @@ async def course_delta(callback: CallbackQuery):
 
     new_price = await change_course_price(channel_id, delta)
     if new_price is None:
-        await callback.answer("❌ Course नहीं मिला.", show_alert=True)
+        await callback.answer("â Course à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾.", show_alert=True)
         return
 
     course = await get_course(channel_id)
     await callback.message.edit_text(
-        "💰 <b>COURSE PRICE</b>\n\n"
-        f"📚 <b>{clean_html(course[3])}</b>\n"
+        "ð° <b>COURSE PRICE</b>\n\n"
+        f"ð <b>{clean_html(course[3])}</b>\n"
         f"Current: <b>{money(new_price)}</b>",
         reply_markup=course_price_kb(channel_id, new_price // 100),
         parse_mode="HTML"
     )
-    await callback.answer(f"Updated: ₹{new_price // 100}")
 
 
 @router.callback_query(F.data.startswith("price:manual_course:"))
 async def manual_course_start(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
+    await callback.answer()
 
     channel_id = int(callback.data.rsplit(":", 1)[1])
-    manual_price_mode.add((callback.from_user.id, channel_id))
+    uid = callback.from_user.id
+    all_price_mode.discard(uid)
+    manual_price_mode.discard(uid)
+    for item in list(manual_price_mode):
+        if isinstance(item, tuple) and item[0] == uid:
+            manual_price_mode.discard(item)
+    manual_price_mode.add((uid, channel_id))
 
     await callback.message.answer(
-        "✏️ <b>MANUAL COURSE PRICE</b>\n\n"
-        "अब सिर्फ नई price भेजो।\n\n"
+        "âï¸ <b>MANUAL COURSE PRICE</b>\n\n"
+        "à¤à¤¬ à¤¸à¤¿à¤°à¥à¤« à¤¨à¤ price à¤­à¥à¤à¥à¥¤\n\n"
         "Example:\n"
         "<code>799</code>",
         parse_mode="HTML"
     )
-    await callback.answer()
 
 
 @router.callback_query(F.data == "price:nop")
@@ -1235,17 +1429,17 @@ async def owner_price_text(message: Message):
             if rupees < 1:
                 raise ValueError
         except ValueError:
-            await message.answer("❌ सिर्फ valid rupee amount भेजो। Example: 499")
+            await message.answer("â à¤¸à¤¿à¤°à¥à¤« valid rupee amount à¤­à¥à¤à¥à¥¤ Example: 499")
             return
 
         count = await set_all_course_prices(rupees)
         all_price_mode.discard(uid)
 
         await message.answer(
-            "✅ <b>ALL CHANNELS PRICE UPDATED</b>\n\n"
-            f"💰 New Price: <b>₹{rupees}</b>\n"
-            f"📚 Channels Updated: <b>{count}</b>",
-            reply_markup=back_kb(),
+            "â <b>ALL CHANNELS PRICE UPDATED</b>\n\n"
+            f"ð° New Price: <b>â¹{rupees}</b>\n"
+            f"ð Channels Updated: <b>{count}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="â¬ï¸ Course Prices", callback_data="own:prices")]]),
             parse_mode="HTML"
         )
         return
@@ -1264,7 +1458,7 @@ async def owner_price_text(message: Message):
                 raise ValueError
         except ValueError:
             await message.answer(
-                "❌ Format गलत है.\n\n"
+                "â Format à¤à¤²à¤¤ à¤¹à¥.\n\n"
                 "Example:\n"
                 "<code>-1001234567890 599</code>",
                 parse_mode="HTML"
@@ -1273,16 +1467,16 @@ async def owner_price_text(message: Message):
 
         course = await get_course(channel_id)
         if not course:
-            await message.answer("❌ यह channel auto-detected नहीं है।")
+            await message.answer("â à¤¯à¤¹ channel auto-detected à¤¨à¤¹à¥à¤ à¤¹à¥à¥¤")
             return
 
         await set_course_price(channel_id, rupees)
         manual_price_mode.discard(uid)
 
         await message.answer(
-            "✅ <b>MANUAL PRICE UPDATED</b>\n\n"
-            f"📚 {clean_html(course[3])}\n"
-            f"💰 New Price: <b>₹{rupees}</b>",
+            "â <b>MANUAL PRICE UPDATED</b>\n\n"
+            f"ð {clean_html(course[3])}\n"
+            f"ð° New Price: <b>â¹{rupees}</b>",
             reply_markup=back_kb(),
             parse_mode="HTML"
         )
@@ -1305,23 +1499,23 @@ async def owner_price_text(message: Message):
             if rupees < 1:
                 raise ValueError
         except ValueError:
-            await message.answer("❌ सिर्फ valid price भेजो। Example: 799")
+            await message.answer("â à¤¸à¤¿à¤°à¥à¤« valid price à¤­à¥à¤à¥à¥¤ Example: 799")
             return
 
         course = await get_course(channel_id)
         if not course:
             manual_price_mode.discard(target)
-            await message.answer("❌ Course नहीं मिला।")
+            await message.answer("â Course à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾à¥¤")
             return
 
         await set_course_price(channel_id, rupees)
         manual_price_mode.discard(target)
 
         await message.answer(
-            "✅ <b>COURSE PRICE UPDATED</b>\n\n"
-            f"📚 {clean_html(course[3])}\n"
-            f"💰 New Price: <b>₹{rupees}</b>",
-            reply_markup=back_kb(),
+            "â <b>COURSE PRICE UPDATED</b>\n\n"
+            f"ð {clean_html(course[3])}\n"
+            f"ð° New Price: <b>â¹{rupees}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="â¬ï¸ Course Prices", callback_data="own:prices")]]),
             parse_mode="HTML"
         )
 
@@ -1333,14 +1527,14 @@ async def owner_price_text(message: Message):
 @router.callback_query(F.data.startswith("member:"))
 async def member_action(callback: CallbackQuery):
     if not await owner_only(callback.from_user.id):
-        await callback.answer("❌ Owner only.", show_alert=True)
+        await callback.answer("â Owner only.", show_alert=True)
         return
 
     _, action, gid = callback.data.split(":")
     grant = await get_member(int(gid))
 
     if not grant:
-        await callback.answer("❌ Member record नहीं मिला.", show_alert=True)
+        await callback.answer("â Member record à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾.", show_alert=True)
         return
 
     _, user_id, channel_id, course_name, invite_link, status, _, _ = grant
@@ -1354,17 +1548,17 @@ async def member_action(callback: CallbackQuery):
                 except Exception:
                     pass
             await mark_member(int(gid), "revoked")
-            await callback.answer("🚫 Member banned.", show_alert=True)
+            await callback.answer("ð« Member banned.", show_alert=True)
 
         elif action == "unban":
             await bot.unban_chat_member(channel_id, user_id, only_if_banned=True)
             await mark_member(int(gid), "active")
-            await callback.answer("♻️ Member unbanned.", show_alert=True)
+            await callback.answer("â»ï¸ Member unbanned.", show_alert=True)
 
     except Exception as e:
         print("MEMBER ACTION:", e)
         await callback.answer(
-            "❌ Action failed. Bot को channel में Ban Users permission दें।",
+            "â Action failed. Bot à¤à¥ channel à¤®à¥à¤ Ban Users permission à¤¦à¥à¤à¥¤",
             show_alert=True
         )
         return
@@ -1390,12 +1584,12 @@ async def channels_cmd(message: Message):
         return
     courses = await get_courses()
     if not courses:
-        await message.answer("❌ कोई channel auto-detect नहीं हुआ।")
+        await message.answer("â à¤à¥à¤ channel auto-detect à¤¨à¤¹à¥à¤ à¤¹à¥à¤à¥¤")
         return
 
-    text = "📚 <b>CHANNELS</b>\n\n"
+    text = "ð <b>CHANNELS</b>\n\n"
     for cid, _, _, name, price in courses:
-        text += f"📚 <b>{clean_html(name)}</b>\n🆔 <code>{cid}</code>\n💰 {money(price)}\n\n"
+        text += f"ð <b>{clean_html(name)}</b>\nð <code>{cid}</code>\nð° {money(price)}\n\n"
     await message.answer(text[:4000], parse_mode="HTML")
 
 
@@ -1414,19 +1608,38 @@ async def setprice_cmd(message: Message):
         cid = int(parts[1])
         price = int(parts[2])
     except ValueError:
-        await message.answer("❌ Invalid data.")
+        await message.answer("â Invalid data.")
         return
 
     course = await get_course(cid)
     if not course:
-        await message.answer("❌ Channel नहीं मिला.")
+        await message.answer("â Channel à¤¨à¤¹à¥à¤ à¤®à¤¿à¤²à¤¾.")
         return
 
     await set_course_price(cid, price)
     await message.answer(
-        f"✅ {clean_html(course[3])}\n💰 ₹{price}",
+        f"â {clean_html(course[3])}\nð° â¹{price}",
         parse_mode="HTML"
     )
+
+
+@router.message(Command("razorpay_test"))
+async def razorpay_test(message: Message):
+    if not await owner_only(message.from_user.id):
+        return
+    try:
+        result = await razorpay("GET", "/payment_links?count=1")
+        await message.answer(
+            "â <b>Razorpay API Connected</b>\n\n"
+            f"Response: <code>{clean_html(json.dumps(result)[:2500])}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(
+            "â <b>Razorpay API Error</b>\n\n"
+            f"<code>{clean_html(str(e)[:3000])}</code>",
+            parse_mode="HTML"
+        )
 
 
 # ============================================================
@@ -1439,6 +1652,11 @@ async def main():
     global BOT_USERNAME
     me = await bot.get_me()
     BOT_USERNAME = me.username or ""
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception as e:
+        print("WEBHOOK CLEANUP:", e)
 
     demo_task = asyncio.create_task(demo_cleaner())
     payment_task = asyncio.create_task(payment_checker())
